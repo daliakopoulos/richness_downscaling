@@ -1,0 +1,483 @@
+---
+title: "Spatial Downscaling of Alien Species Presences using Machine Learning"
+author: "Ioannis N Daliakopoulos*, Stelios Katsanevakis and Aristides Moustakas"
+date: '*Correspondance: daliakopoulos@hydromech.gr'
+output:
+  word_document: default
+  pdf_document: default
+  html_document: default
+fig_caption: yes
+---
+
+```{r Options, echo=F}
+rm(list=ls()) #clear workspace
+knitr::opts_chunk$set(cache=TRUE, fig.width=12, fig.height=8,
+                      echo=T, warning=FALSE, message=FALSE)
+options(digits=3, width = 600)
+```
+Load required libraries
+```{r Libraries}
+library(rgdal)
+library(raster)
+library(R2BayesX)
+library(tidyr)
+library(party)
+library(randomForest)
+library(caret)
+library(ROCR)
+library(e1071)
+library(matrixStats)
+library(vita)
+library(ggplot2)
+library(Hmisc)
+library(gridExtra)
+```
+Initialize plotting function for maps
+```{r Plotting functions for maps}
+plot_map = function(p, x, title){
+  plot(p, main=title)
+  image(x, col=rev(heat.colors(255)), add=TRUE)
+  plot(p, add=TRUE)
+  tick_locations = c(minValue(x), maxValue(x))
+  colorlegend(color = heat.colors, swap=TRUE, plot=FALSE, 
+              at= tick_locations, pos=c(0.55,0.9), add=TRUE, range = tick_locations)
+  axis(1, tck=.02, at=x<-seq(450000, 700000, by=50000 ), 
+       labels=c(450, 500, 550, 600, 650, "700 km"))
+  axis(2, tck=.02, at=x<-seq(3850000, 3950000, by=50000 ), 
+       labels=c("3,850", "3,900", "3,950 km"))
+  box()  
+}
+```
+Initialize plotting function for partial plots
+```{r Plotting functions for partials}
+plot_partial = function(data, range, ylab, xlab){
+  alpha_value <- 0.5 
+  p<-ggplot(data=data, aes(x=x, y=y)) +
+    geom_point(size=1, alpha=alpha_value, colour = "grey30") +
+    geom_smooth(colour = "black", method = "lm", formula = y ~ splines::bs(x, 3))+
+    geom_line(colour = "red", data=data[range,]) + 
+    theme_bw()+
+    theme(axis.ticks.length = unit(-0.05 , "cm"))+ 
+    theme(axis.text.x = element_text(margin=margin(3,3,3,3,"pt")))+
+    theme(axis.text.y = element_text(margin=margin(3,3,3,3,"pt")))+
+    ylab(ylab)+
+    xlab(xlab)+ 
+    ylim(0, 1)
+  p$labels$colour<-""
+  p
+}
+```
+Initialize plotting function for shaded areas
+```{r Plotting functions for shaded areas}
+stat_sum_df <- function(fun, geom="crossbar", ...) {
+  stat_summary(fun.data=fun, geom=geom, ...)
+}
+
+```
+
+Initialize function to estimate number of ticks in plots
+```{r Plotting functions for number of ticks}
+number_ticks <- function(n) {function(limits) pretty(limits, n)}
+```
+
+Import shape file for maps
+```{r Import shape file}
+p <- shapefile("crete_gr.shp")
+```
+
+Import data
+```{r Import data}
+# read raster file of cell code values
+b <- brick("cell_codes.asc")
+s <- stack(b) # create stack starting with cell codes
+# read ecological dataset (this is the richness for crete)
+v <- read.csv(file="Crete_alien.csv", header=TRUE, sep=",")
+
+# full absence-presence file for all spp
+raw.all_spp <- read.table(file="crete_rawdata2.csv", sep="\t",
+                          as.is = TRUE,  header=FALSE,
+                          stringsAsFactors=FALSE)
+raw.all_spp <- as.data.frame(t(raw.all_spp),
+                             stringsAsFactors=FALSE)
+
+# definition of alien spp
+a <- read.table(file="alien_list.txt", as.is = TRUE, sep=",")
+
+raw.alien_spp <- NULL
+raw.alien_spp <- rbind(raw.alien_spp, raw.all_spp[,1])
+# keep presenses only for alien spp
+for (i in 2:dim(raw.all_spp)[2]){
+  isalien <- which(a==raw.all_spp[1,i])
+  if (length(isalien)>0){
+    #raw.alien_spp[counter]<-raw.alien_spp[,-i]
+    raw.alien_spp <- rbind(raw.alien_spp, raw.all_spp[,i])
+  }
+}
+
+cells.no_of_aliens <- NULL
+cells.withaliens <- NULL
+
+for (i in 2:dim(raw.alien_spp)[2]){
+  if (sum(as.numeric(raw.alien_spp[-1,i])) >0){
+    cells.withaliens <- c(cells.withaliens, 
+                        as.numeric(raw.alien_spp[1,i]))
+    cells.no_of_aliens <- c(cells.no_of_aliens,
+                          sum(as.numeric(raw.alien_spp[-1,i])))
+  }
+}
+``` 
+
+Turn richness dataset to stack of rasters
+```{r Turn richness dataset to stack of rasters}
+if (!file.exists("alien.RData")){
+  temp <- b
+  temp[temp>0]<-NA # a temp raster the size of the code layer
+  alien <- s
+  
+  for (i in 1:length(v)) {
+    names(temp) <- names(v[i])       # name layer with variable name
+    alien <- stack(alien, temp) 
+  }
+  
+  cells.notempty <- as.vector(alien$cell_codes)
+  cells.notempty <- cells.notempty[!is.na(cells.notempty)]
+  
+  for (val in cells.notempty){ # for each cell code
+    line <- which(v[,1]==val)      # find cell code in dataset
+    if (length(line)>0){
+      for (i in 2:dim(alien)[3]) {# if the code exists
+          alien[[i]][b==val] <- v[line,i-1]   # replace code with value
+      }
+    }
+  }
+  save(alien, file = "alien.RData") #save for later
+}else{
+  load("alien.RData")
+}
+```
+Turn presense/absence dataset to stack of rasters
+```{r Turn presense/absence dataset to stack of rasters}
+# fill stack with the values from the presence/absence dataset 
+# taking addresses from the cell code layer
+if (!file.exists("presence.RData")){
+  presence <- s
+  for (i in 2:dim(raw.alien_spp)[1]) {
+    names(temp) = raw.alien_spp[i,1] # name layer with variable name
+    presence <- stack(presence, temp) 
+  }
+  for (i in 2:dim(raw.alien_spp)[1]) {
+    for (val in cells.withaliens){ # for each cell code
+      line = which(as.numeric(raw.alien_spp[1,-1])==val)      # find cell code in dataset
+      if (length(line)>0){          # if the code exists
+        presence[[i]][b==val]=as.numeric(raw.alien_spp[i,line])   # replace code with value
+      }
+    }
+  }
+  save(presence, file = "presence.RData") #save for later
+}else{
+  load("presence.RData")
+}
+```
+Turn individual spp presense into alien presence
+```{r Turn individual spp presense into alien presence}
+alien_10k <- stackApply(subset(presence,2:nlayers(presence)), 
+                        nlayers(presence), fun=sum )
+names(alien_10k) <- "alien_10k"
+
+if (!any(names(alien)=="alien_10k")){
+    alien <- stack(alien, alien_10k) # add to original stack
+}
+```
+Estimate the aggregated predictor
+```{r Estimate the aggregated predictor}
+presence_20k <- disaggregate(aggregate(presence, fact = 2 , fun = any, na.rm = TRUE ), 
+                  fact=2)
+alien_20k <- stackApply(subset(presence_20k,2:nlayers(presence_20k)), 
+                        nlayers(presence_20k), fun=sum )
+
+#manage differences in extent of resampled raster
+alien_20k<-crop(alien_20k, extent(alien_10k))
+names(alien_20k) <- "alien_20k"
+
+
+if (!any(names(alien)=="alien_20k")){
+    alien <- stack(alien, alien_20k) # add to original stack
+}
+
+save(alien, file = "alien.RData") #save for later
+```
+Alien input-output plots
+```{r Alien input-output plots, fig.width=12, fig.height=3.5}
+load("alien.RData") # load the data in case you dont want to estimate it again
+
+# do some plotting to make sure data has been read correctly
+tiff("Figure_1.tiff", width = 12, height = 3.5, units = 'in', res = 300)
+par(mfrow=c(1,2))
+plot_map(p, alien$alien_10k, "Alien ssp presence 8.25 x 8.25 km")
+plot_map(p, alien$alien_20k, "Alien spp presence 16.5 x 16.5 km")
+dev.off()
+```
+Prepare data for bootstrap Random Forest
+```{r Prepare data for bootstrap Random Forest}
+# make a mask from altitude raster in order to clean up data from non-ground values
+data_temp <- as.data.frame((alien), xy = TRUE)
+ind.notempty <- which(with(data_temp, data_temp$Alt>=0))
+data <- data_temp[ind.notempty,]
+
+ind.keep <- c("alien_10k", "alien_20k", "Hab_Div", "Artif_Hab", "Agric_Hab",
+              "Nat_Hab", "Endemic_Spp_Richness", "Natura", "Alt", "Alt_Range",
+              "Soil_Div", "Temp_Mean", "Temp_Warm", "Temp_Cold", "Temp_Range", 
+              "Precip_Mean", "Precip_Wet", "Precip_Dry", "Precip_Range", 
+              "Artif_Cover", "Agric_Cover", "Natural_Cover")
+
+data <- data[ind.keep]
+data$alien_10k[data$alien_10k>0] <- 1
+data$alien_20k[data$alien_20k>0] <- 1
+data$alien_10k <- as.factor(data$alien_10k) 
+data$alien_20k <- as.factor(data$alien_20k) 
+
+save(data, file = "data.RData") #save for later
+```
+Run bootstrap Random Forest
+```{r Run bootstrap Random Forest}
+
+if (!file.exists("results.RData")){
+  start.time <- Sys.time()
+  
+  load("data.RData") # load the data 
+  # uncomment to have replicatable results
+  #set.seed(12345)
+  temp_frame <- numeric(4)
+  
+  temp_frame$id <- NULL
+  temp_frame$cutoff <- NULL
+  temp_frame$value <- NULL
+  temp_frame$group <- NULL
+  temp_partial <- NULL
+  
+  ind.iterations <- 100
+  rf.importance2 <- NULL
+  rf.importance7 <- NULL
+  rf.gini2 <- NULL
+  rf.gini7 <- NULL
+  
+  rf.partial2 <- NULL
+  rf.partial2 <- NULL
+  rf.partial7 <- NULL
+  rf.partial7 <- NULL
+  
+  # bootstrap - this will take a while
+  for (i in 1:ind.iterations){
+    # break data in training and testing 
+    ind.train = sample(2,nrow(data), replace=TRUE, prob=c(0.7, 0.3)) 
+    data_train = data[ind.train==1,] #70% training 
+    data_test = data[ind.train==2,]  #30% testing
+    
+    cutoff_intervals <- seq(0.1, 0.9, by = 0.1) # 0.05 does not work that well
+    result.TN <- numeric(length(cutoff_intervals)) # correct rejection
+    result.FN <- numeric(length(cutoff_intervals)) # miss (type ii)
+    result.FP <- numeric(length(cutoff_intervals)) # false alarm (type i)
+    result.TP <- numeric(length(cutoff_intervals)) # hit
+    
+    ind.counter <- 0
+    
+    for (ind.cutoff in cutoff_intervals){
+      fit <- randomForest(alien_10k ~.,
+                        data=data_train, 
+                        importance=TRUE, 
+                        do.trace=FALSE,
+                        mtry=2,
+                        ntree=10000, 
+                        cutoff = c(1-ind.cutoff, ind.cutoff))
+      
+      ind.counter <- ind.counter + 1  
+      
+      prediction <- predict(fit, data_test, type = "response") # predict responce
+      
+      result_temp <- confusionMatrix(prediction,data_test$alien_10k, positive = '1')
+      
+      result.TN <- result_temp$table[1]
+      result.FN <- result_temp$table[2]
+      result.FP <- result_temp$table[3]
+      result.TP <- result_temp$table[4]
+    
+      result.P <- result.TP+result.FN
+      result.N <- result.TN+result.FP
+     
+      if (result.N >0 && result.P>0){
+        temp_frame <- rbind(temp_frame, c(ind.counter, ind.cutoff,result.TN, "TN"))
+        temp_frame <- rbind(temp_frame, c(ind.counter, ind.cutoff,result.FN, "FN"))
+        temp_frame <- rbind(temp_frame, c(ind.counter, ind.cutoff,result.FP, "FP"))
+        temp_frame <- rbind(temp_frame, c(ind.counter, ind.cutoff,result.TP, "TP"))
+     
+        if (ind.counter == 2){
+        rf.importance2 <- cbind(rf.importance2, importance(fit)[,3] )
+        rf.gini2 <- cbind(rf.gini2, importance(fit)[,4] )
+          for(column in names(data_test)){ 
+            pp <- partialPlot(fit, data_test, x.var=toString(column), plot = F)
+            rf.partial2[[column]]$x <- c(rf.partial2[[column]]$x, t(pp$x))
+            rf.partial2[[column]]$y <- c(rf.partial2[[column]]$y, t(pp$y))
+          }
+        }
+        if (ind.counter == 7){
+          rf.importance7 <- cbind(rf.importance7, importance(fit)[,3] )
+          rf.gini7 <- cbind(rf.gini7, importance(fit)[,4] )
+          for(column in names(data_test)){ 
+            pp <- partialPlot(fit, data_test, x.var=toString(column), plot = F)
+            rf.partial7[[column]]$x <- c(rf.partial7[[column]]$x, t(pp$x))
+            rf.partial7[[column]]$y <- c(rf.partial7[[column]]$y, t(pp$y))
+          }
+        }      
+      }
+    }
+  }
+  
+  results <- data.frame(temp_frame[-1,])
+  names(results) <- c("id", "cutoff", "value", "group")
+  
+  results$group <- as.character(results$group)
+  results$cutoff <- as.numeric(results$cutoff)
+  results$value <- as.numeric(results$value)
+  results$id <- as.numeric(results$id)
+  
+  save(results, file = "results.RData") #save for later
+  save(rf.partial2, file = "rfpartial2.RData")
+  save(rf.partial7, file = "rfpartial7.RData")
+  
+  save(rf.importance2, file = "rfimportance2.RData")
+  save(rf.importance7, file = "rfimportance7.RData")
+  
+  save(rf.gini2, file = "rfgini2.RData")
+  save(rf.gini7, file = "rfgini7.RData")
+  
+  end.time <- Sys.time()
+  time.taken <- end.time - start.time
+  time.taken
+}else{
+  load('results.RData')
+  load('rfpartial2.RData')
+  load('rfpartial7.RData')
+  load('rfimportance2.RData')
+  load('rfimportance7.RData')
+  load('rfgini2.RData')
+  load('rfgini7.RData')
+}
+
+```
+Plot importance and genie index
+```{r Plot importance and genie index}
+formal.names <- c("alien_20k", 
+                  "Habitat Diversity", "Artificial Habitat", "Agricultural Habitat",
+                  "Natural Habitat", "Endemic spp richness", "Natura", 
+                  "Altitude range", "Altitude", "Soil type diversity",
+                  "Mean temperature", "Maximum temperature", "Minimum temperature", 
+                  "Temperature range", "Mean precipitation", "Maximum precipitation",
+                  "Minimum precipitation", "Precipitation range", "Artificial cover", 
+                  "Agricultural cover", "Natural cover")
+
+rf.importance7_use<-as.data.frame(t(rf.importance7))
+colnames(rf.importance7_use)<-formal.names
+mns <- colMedians(as.matrix(rf.importance7_use), na.rm=TRUE)
+rf.importance7_use <- rf.importance7_use[,order(mns)]
+rf.importance7_use<-rf.importance7_use[!names(rf.importance7_use)=="alien_20k"] #exclude alien_20k
+
+rf.gini7_use<-as.data.frame(t(rf.gini7))
+colnames(rf.gini7_use)<-formal.names
+mns <- colMedians(as.matrix(rf.gini7_use), na.rm=TRUE)
+rf.gini7_use <- rf.gini7_use[,order(mns)]
+rf.gini7_use<-rf.gini7_use[!names(rf.gini7_use)=="alien_20k"] #exclude alien_20k
+
+tiff("Figure_2.tiff", width = 12, height = 6, units = 'in', res = 300)
+rf.gini7_long <- gather(rf.gini7_use, type, value, factor_key=TRUE)
+rf.importance7_long <- gather(rf.importance7_use, type, value, factor_key=TRUE)
+
+p_gimp.1 <- ggplot(rf.importance7_long, aes(type, value)) +
+  theme_bw()+
+  theme(axis.ticks.length = unit(-1 , "pt"))+
+  theme(axis.text.x = element_text(margin=margin(5,5,5,5,"pt")))+
+  theme(axis.text.y = element_text(margin=margin(5,5,5,5,"pt")))+
+  geom_boxplot() +
+  coord_flip()+
+  ylab("Mean Decrease in Accuracy")+
+  xlab("") 
+
+p_gimp.2 <- ggplot(rf.gini7_long, aes(type, value)) + 
+  theme_bw()+
+  theme(axis.ticks.length = unit(-1 , "pt"))+
+  theme(axis.text.x = element_text(margin=margin(5,5,5,5,"pt")))+
+  theme(axis.text.y = element_text(margin=margin(5,5,5,5,"pt")))+
+  geom_boxplot() +
+  coord_flip()+
+  ylab("Mean Decrease Gini")+
+  xlab("") 
+
+grid.arrange(p_gimp.1, p_gimp.2, ncol=2, nrow=1)
+dev.off()
+```
+Plot partials comparison
+```{r Plot partials comparison}
+tiff("Figure_3.tiff", width = 12, height = 6, units = 'in', res = 300)
+p_part.11 <- plot_partial(as.data.frame(rf.partial7$Natural_Cover), 542:590, 
+                          "", "Natural Cover [%]")
+p_part.12 <- plot_partial(as.data.frame(rf.partial7$Agric_Cover), 539:587, 
+                          "", "Agricultural cover [%]")
+p_part.13 <- plot_partial(as.data.frame(rf.partial7$Endemic_Spp_Richness), 531:553, 
+                          "", "Endemic spp richness")
+p_part.21 <- plot_partial(as.data.frame(rf.partial7$Alt_Range), 515:558, 
+                          "Alien spp presence", "Altitude")
+p_part.22 <- plot_partial(as.data.frame(rf.partial7$Alt), 502:545, 
+                          "", "Altitude range [m]")
+p_part.23 <- plot_partial(as.data.frame(rf.partial7$Temp_Mean), 555:581,
+                          "", expression(paste("Mean temperature", ~degree*C)))
+p_part.31 <- plot_partial(as.data.frame(rf.partial7$Precip_Mean), 549:580, 
+                          "", "Mean precipitation [mm]")
+p_part.32 <- plot_partial(as.data.frame(rf.partial7$Precip_Range), 545:577, 
+                          "", "Precipitation range [mm]")
+p_part.33 <- plot_partial(as.data.frame(rf.partial7$Natura), 546:585, 
+                          "", "Natura cover [%]")
+
+grid.arrange(p_part.11, p_part.12, p_part.13, 
+             p_part.21, p_part.22, p_part.23,
+             p_part.31, p_part.32, p_part.33,
+             ncol=3, nrow=3)
+dev.off()
+```
+Plot statistics vs cutoff
+```{r Plot stats vs cutoff, fig.width=12, fig.height=6}
+ind.counter <- 1
+
+for(i in seq_len(nrow(results))){
+  results$id[i] <- ind.counter
+  if (i/4==floor(i/4)){
+    ind.counter <- ind.counter + 1
+  }
+}
+
+results.wide <- spread(results, group, value)
+results.wide$TNR <- results.wide$TN / (results.wide$TN + results.wide$FP)
+results.wide$TPR <- results.wide$TP / (results.wide$TP + results.wide$FN)
+
+N = results.wide$TN + results.wide$TP + results.wide$FN + results.wide$FP
+S = (results.wide$TP + results.wide$FN)/N
+P = (results.wide$TP + results.wide$FP)/N
+results.wide$MCC = (results.wide$TP/N - S*P)/sqrt(P*S*(1-S)*(1-P))
+
+results.wide <- results.wide[, !(colnames(results.wide) %in% c("FN","FP","TN","TP"))]
+results.long <- gather(results.wide,group, value, TNR:MCC)
+
+tiff("Figure_4.tiff", width = 12, height = 6, units = 'in', res = 300)
+p<-ggplot(data=as.data.frame(results.long), 
+          aes(x=cutoff, y=value, group=group, colour=group)) +
+          stat_sum_df("mean_cl_boot",geom="smooth")+
+          scale_y_continuous (breaks=number_ticks(10))+
+          ylab("Value")+
+          xlab("Cutoff value")+
+          theme_bw(base_size = 18)+
+          theme(axis.ticks.length = unit(-5 , "pt"))+
+          theme(axis.text.x = element_text(margin=margin(10,10,10,10,"pt")))+
+          theme(axis.text.y = element_text(margin=margin(10,10,10,10,"pt")))+
+          theme(legend.position = c(.07, .7))
+p$labels$colour<-""
+print(p)
+dev.off()
+```
